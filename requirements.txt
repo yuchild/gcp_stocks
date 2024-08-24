@@ -1,0 +1,9 @@
+yfinance
+google-cloud-bigquery
+pandas
+numpy
+csv
+os
+datetime 
+math 
+pykalman

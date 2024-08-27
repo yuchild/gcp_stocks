@@ -107,5 +107,215 @@ def fetch_data_starter_data(stock_list = read_symbols_csv()):
         
     return print(f'Start time: {start_time}\nDownloaded {ctn} max daily, hourly, 30m, and 15m stock data\nEnd Time: {end_time}')
 
-  if __name__ == "__main__":
+#########################################
+# functions for use to transform tables #
+#########################################
+
+# candle parts percentages
+def candle_parts_pcts(o, c, h, l):
+    full = h - l
+    body = abs(o - c)
+    if o > c:
+        top_wick = h - o
+        bottom_wick = c - l
+    else:
+        top_wick = h - c
+        bottom_wick = o - l
+    return top_wick / full, body / full, bottom_wick / full
+
+
+# previous close and open gap % of pervious candle size
+def gap_up_down_pct(o, pc, ph, pl):
+    if o == pc:
+        return 0
+    else:
+        return (o - pc) / (ph - pl)
+    
+    
+# z-score calculation
+def zscore(x, mu, stdev):
+    return (x - mu) / stdev
+
+
+# direction calculation:
+def direction(today, tomorrow):
+    pct_change = (tomorrow - today) / today
+    if pct_change > 0.0075:
+        return 1
+    elif pct_change < -0.0075:
+        return 2
+    else:
+        return 0
+    
+
+###########################################
+# functions for use to get ETL/ELT tables #
+###########################################
+
+# read curated stock symbols from static file
+def read_symbols_csv():
+
+    file_path = path.join("static", "symbols.csv")
+   
+    result = []
+    
+    # Check if the file exists
+    if not path.exists(file_path):
+        print(f"The file {file_path} does not exist.")
+        return result
+    
+    with open(file_path, 'r') as file:
+        csv_reader = reader(file)
+        
+        for row in csv_reader:
+            # Assuming the CSV file has two columns: symbol and date
+            if len(row) == 2:
+                symbol, date = row
+                result.append((symbol, date))
+            else:
+                print(f"Skipping invalid row: {row}")
+    
+    return result
+
+
+# returns now timestamp
+def current_time():
+    
+    today = date.today()
+    now = datetime.now().strftime("%H:%M:%S")
+    
+    return f'{today} {now}'
+    
+
+###################################
+# class for table transformations #
+###################################
+
+class transforms:
+    def __init__(self, stock_list):
+        self.stock_list = stock_list
+
+    def load_transform_tables(self):
+        for item in self.stock_list:
+            self.transform_data(item[0], '1d')
+            self.transform_data(item[0], '1h')
+            self.transform_data(item[0], '30m')
+            self.transform_data(item[0], '15m')
+
+    def transform_data(self, stock, timeframe):
+        stock_df = self.load_data(stock, timeframe)
+
+        # Kalman filtering (noise reduction algorithm)
+        kf = KalmanFilter(transition_matrices=[1],
+                          observation_matrices=[1],
+                          initial_state_mean=0,
+                          initial_state_covariance=1,
+                          observation_covariance=1,
+                          transition_covariance=0.01)
+
+        state_means, _ = kf.filter(stock_df['Close'].values)
+        state_means = pd.Series(state_means.flatten(), index=stock_df.index)
+        stock_df['kma'] = state_means
+        stock_df['sma40'] = stock_df['Close'].rolling(window=40).mean().copy()
+        stock_df['kma_sma40_diff'] = (stock_df['kma'] - stock_df['sma40']).copy()
+        stock_df['kma_sma40_diff_stdev21'] = stock_df['kma_sma40_diff'].rolling(window=21).std().copy()
+        stock_df['kma_sma40_diff_mu21'] = stock_df['kma_sma40_diff'].rolling(window=21).mean().copy()
+
+        # Calculate Kalman Filter vs SMA40 difference z-score
+        stock_df['kma_sma40_diff_z21'] = stock_df.apply(lambda row: self.zscore(row['kma_sma40_diff'], row['kma_sma40_diff_mu21'], row['kma_sma40_diff_stdev21']), axis=1, result_type='expand').copy()
+
+        # Update table: candle parts %'s
+        stock_df[['pct_top_wick', 'pct_body', 'pct_bottom_wick']] = stock_df.apply(lambda row: self.candle_parts_pcts(row['Open'], row['Close'], row['High'], row['Low']), axis=1, result_type='expand').copy()
+
+        # Standard deviation of adjusted close
+        stock_df['top_stdev21'] = stock_df['pct_top_wick'].rolling(window=21).std().copy()
+        stock_df['body_stdev21'] = stock_df['pct_body'].rolling(window=21).std().copy()
+        stock_df['bottom_stdev21'] = stock_df['pct_bottom_wick'].rolling(window=21).std().copy()
+
+        # Mean of adjusted close
+        stock_df['top_mu21'] = stock_df['pct_top_wick'].rolling(window=21).mean().copy()
+        stock_df['body_mu21'] = stock_df['pct_body'].rolling(window=21).mean().copy()
+        stock_df['bottom_mu21'] = stock_df['pct_bottom_wick'].rolling(window=21).mean().copy()
+
+        # Z-score of adjusted close
+        stock_df['top_z21'] = stock_df.apply(lambda row: self.zscore(row['pct_top_wick'], row['top_mu21'], row['top_stdev21']), axis=1, result_type='expand').copy()
+        stock_df['body_z21'] = stock_df.apply(lambda row: self.zscore(row['pct_body'], row['body_mu21'], row['body_stdev21']), axis=1, result_type='expand').copy()
+        stock_df['bottom_z21'] = stock_df.apply(lambda row: self.zscore(row['pct_bottom_wick'], row['bottom_mu21'], row['bottom_stdev21']), axis=1, result_type='expand').copy()
+
+        # Update table: % gap between current open relative to previous candle size
+        stock_df['pc'] = stock_df['Close'].shift(1).copy()
+        stock_df['ph'] = stock_df['High'].shift(1).copy()
+        stock_df['pl'] = stock_df['Low'].shift(1).copy()
+        stock_df['pct_gap_up_down'] = stock_df.apply(lambda row: self.gap_up_down_pct(row['Open'], row['pc'], row['ph'], row['pl']), axis=1, result_type='expand').copy()
+
+        # Standard deviation of adjusted close
+        stock_df['gap_stdev21'] = stock_df['pct_top_wick'].rolling(window=21).std().copy()
+
+        # Mean of adjusted close
+        stock_df['gap_mu21'] = stock_df['pct_top_wick'].rolling(window=21).mean().copy()
+
+        # Z-score of adjusted close
+        stock_df['gap_z21'] = stock_df.apply(lambda row: self.zscore(row['pct_gap_up_down'], row['gap_mu21'], row['gap_stdev21']), axis=1, result_type='expand').copy()
+        
+        # Standard deviation of adjusted close
+        stock_df['ac_stdev5'] = stock_df['Adj Close'].rolling(window=5).std().copy()
+        stock_df['ac_stdev8'] = stock_df['Adj Close'].rolling(window=8).std().copy()
+        stock_df['ac_stdev13'] = stock_df['Adj Close'].rolling(window=13).std().copy()
+
+        # Mean of adjusted close
+        stock_df['ac_mu5'] = stock_df['Adj Close'].rolling(window=5).mean().copy()
+        stock_df['ac_mu8'] = stock_df['Adj Close'].rolling(window=8).mean().copy()
+        stock_df['ac_mu13'] = stock_df['Adj Close'].rolling(window=13).mean().copy()
+
+        # Z-score of adjusted close
+        stock_df['ac_z5'] = stock_df.apply(lambda row: self.zscore(row['Adj Close'], row['ac_mu5'], row['ac_stdev5']), axis=1, result_type='expand').copy()
+        stock_df['ac_z8'] = stock_df.apply(lambda row: self.zscore(row['Adj Close'], row['ac_mu8'], row['ac_stdev8']), axis=1, result_type='expand').copy()
+        stock_df['ac_z13'] = stock_df.apply(lambda row: self.zscore(row['Adj Close'], row['ac_mu13'], row['ac_stdev13']), axis=1, result_type='expand').copy()
+
+        # Target column: direction: -1, 0, 1
+        stock_df['adj_close_up1'] = stock_df['Adj Close'].shift(-1).copy()
+        stock_df['direction'] = stock_df.apply(lambda row: self.direction(row['Adj Close'], row['adj_close_up1']), axis=1, result_type='expand').copy()
+
+        # Save file for model building
+        stock_df[['top_z21', 'body_z21', 'bottom_z21', 'top_z21', 'body_z21', 'bottom_z21',
+                  'gap_z21', 'ac_z5', 'ac_z8', 'ac_z13', 'kma_sma40_diff_z21',
+                  'Adj Close', 'direction']].to_pickle(f'./models/{stock}_{timeframe}_model_df.pkl')
+
+    def load_data(self, stock, timeframe):
+        return pd.read_pickle(f'./data/{stock}_{timeframe}_df.pkl')
+
+    def zscore(self, value, mean, stdev):
+        return (value - mean) / stdev if stdev != 0 else 0
+
+    def candle_parts_pcts(self, open, close, high, low):
+        range_ = high - low
+        top_wick = high - max(open, close)
+        bottom_wick = min(open, close) - low
+        body = abs(open - close)
+        return top_wick / range_, body / range_, bottom_wick / range_
+
+    def gap_up_down_pct(self, open, prev_close, prev_high, prev_low):
+        if open > prev_close:
+            return (open - prev_high) / (prev_high - prev_low)
+        elif open < prev_close:
+            return (open - prev_low) / (prev_high - prev_low)
+        return 0
+
+    def direction(self, current_close, future_close):
+        if future_close > current_close:
+            return 1
+        elif future_close < current_close:
+            return -1
+        return 0
+
+# Usage for class transforms
+# stock_list = read_symbols_csv()  # Assuming this function is defined elsewhere
+# transformer = StockDataTransformer(stock_list)
+# transformer.load_transform_tables()
+
+
+
+
+
+if __name__ == "__main__":
     ...
